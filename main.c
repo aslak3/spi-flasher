@@ -215,6 +215,22 @@ int reprogram_flash(flash_dev_t *flash_device)
     return 0;
 }
 
+int read_flash(flash_dev_t *flash_device)
+{
+    uint8_t read_buffer[FLASH_PAGE_SIZE];
+
+    for (uint32_t start_address = 0;
+        start_address < flash_device->capacity_bytes/256 * FLASH_PAGE_SIZE;
+        start_address += FLASH_PAGE_SIZE)
+    {
+        read_bytes(read_buffer, FLASH_PAGE_SIZE, start_address);
+
+        my_write(read_buffer, FLASH_PAGE_SIZE);
+    }
+
+    return 0;
+}
+
 int main()
 {
     // Enable SPI 0 at 1 MHz and connect to GPIOs
@@ -244,7 +260,7 @@ int main()
         my_read(dummy, 1);
 
         uint8_t banner[32];
-        sprintf(banner, "%sf\n", flash_device->name);
+        sprintf(banner, "%s\n", flash_device->name);
         my_write(banner, strlen(banner));
 
         uint8_t command[1];
@@ -252,6 +268,8 @@ int main()
 
         if (command[0] == 'f') {
             reprogram_flash(flash_device);
+        } else if (command[0] == 'r') {
+            read_flash(flash_device);
         }
     }
     return 0;
