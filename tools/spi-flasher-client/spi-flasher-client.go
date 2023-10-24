@@ -176,11 +176,19 @@ func main() {
 	}
 
 	// Get the device type
-	device, err := getLine(port)
+	banner, err := getLine(port)
 	if err != nil {
 		log.Fatalf("Could not read line from port: %s", err)
 	}
-	fmt.Printf("Device: %s\n", device)
+
+	// Get the banner line and parse it into a device string and a capacity
+	var name string
+	var capacity_bytes int
+	_, err = fmt.Sscanf(banner, "%s %d", &name, &capacity_bytes)
+	if err != nil {
+		log.Fatalf("Could not parse the banner, got [%s]: %s", banner, err)
+	}
+	fmt.Printf("Device: %s Capacity: %d\n", name, capacity_bytes)
 
 	if *writeMode {
 		// Send the "we want to flash" code
@@ -203,7 +211,7 @@ func main() {
 			log.Fatalf("Could not send flash command: %s", err)
 		}
 
-		fileData, err := readFlash(port, (4*1024*1024)/8)
+		fileData, err := readFlash(port, capacity_bytes)
 		if err != nil {
 			log.Fatalf("Could not read flash: %s", err)
 		}

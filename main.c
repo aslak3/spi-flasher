@@ -19,7 +19,7 @@
 #define FLASH_STATUS_BUSY_MASK 0x01
 
 typedef struct {
-    uint8_t identificaiton_code;
+    uint8_t identificaiton_code[3];
     char *name;
     uint32_t capacity_bytes;
 } flash_dev_t;
@@ -64,34 +64,58 @@ void send_command(uint8_t command, bool raise_cs)
         gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
 }
 
+#define JEDEC_ALTERA 0xef
+#define JEDEC_SST 0xbf
+#define JEDEC_KH 0xc2
+#define JEDEC_WINBOND 0xef
+
+#define MBITS_TO_BYTES(b) ((b * 1024 * 1024) / 8)
+
 flash_dev_t flash_devices[] = {
     {
-        0b00010011,
+        // Tested
+        { JEDEC_ALTERA, 0x30, 0b00010011 },
         "EPCQ4A",
-        (4 * 1024 * 1024) / 8,
+        MBITS_TO_BYTES(4),
     },
     {
-        0b00010110,
+        { JEDEC_ALTERA, 0x30, 0b00010110 },
         "EPCQ16A",
-        (16 * 1024 * 1024) / 8,
+        MBITS_TO_BYTES(16)
     },
     {
-        0b00010110,
+        { JEDEC_ALTERA, 0x30, 0b00010110 },
         "EPCQ32A",
-        (32 * 1024 * 1024) / 8,
+        MBITS_TO_BYTES(32),
     },
     {
-        0b00010111,
+        { JEDEC_ALTERA, 0x30, 0b00010111 },
         "EPCQ64A",
-        (64 * 1024 * 1024) / 8,
+        MBITS_TO_BYTES(64),
     },
     {
-        0b00011000,
+        { JEDEC_ALTERA, 0x30, 0b00011000 },
         "EPCQ128A",
-       (128 * 1024 *  1024) / 8,
+        MBITS_TO_BYTES(128),
     },
     {
-        0,
+        { JEDEC_SST, 0x25, 0x41 },
+        "SST25VF016B",
+        MBITS_TO_BYTES(16),
+    },
+    {
+        // Tested (reads)
+        { JEDEC_KH, 0x20, 0x16 },
+        "KH25L3233F",
+        MBITS_TO_BYTES(32),
+    },
+    {
+        { JEDEC_WINBOND, 0x60, 0x16 },
+        "W25Q64FW",
+        MBITS_TO_BYTES(64),
+    },
+    {
+        { 0, 0, 0},
         NULL,
         0
     },
@@ -101,18 +125,14 @@ flash_dev_t* get_device_identification(void)
 {
     send_command(FLASH_CMD_READ_DEVICE_IDENTIFICATION, false);
 
-    uint8_t dummy[2];
-    spi_read_blocking(spi_default, 0, dummy, 2);
-
-    uint8_t response[1];
-    spi_read_blocking(spi_default, 0, response, 1);
+    uint8_t response[3];
+    spi_read_blocking(spi_default, 0, response, sizeof(response));
 
     gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
 
-    for (int i = 0; flash_devices[i].identificaiton_code; i++) {
-        if (response[0] == flash_devices[i].identificaiton_code) {
+    for (int i = 0; flash_devices[i].name; i++) {
+        if (memcmp(response, flash_devices[i].identificaiton_code, sizeof(response)) == 0)
             return &flash_devices[i];
-        }
     }
 
     return NULL;
@@ -220,9 +240,10 @@ int read_flash(flash_dev_t *flash_device)
     uint8_t read_buffer[FLASH_PAGE_SIZE];
 
     for (uint32_t start_address = 0;
-        start_address < flash_device->capacity_bytes/256 * FLASH_PAGE_SIZE;
+        start_address < flash_device->capacity_bytes;
         start_address += FLASH_PAGE_SIZE)
     {
+        // Send the content, a page at a time
         read_bytes(read_buffer, FLASH_PAGE_SIZE, start_address);
 
         my_write(read_buffer, FLASH_PAGE_SIZE);
@@ -242,10 +263,12 @@ int main()
     gpio_set_dir(PICO_DEFAULT_SPI_CSN_PIN, true);
     gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
 
+    // Init the USB stdio, disable CRLF translation and disable any buffering
     stdio_init_all();
     stdio_set_translate_crlf(&stdio_usb, false);
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    // Currently the LED is not used
     const uint LED_PIN = PICO_DEFAULT_LED_PIN;
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
@@ -256,13 +279,16 @@ int main()
     }
 
     while (1) {
+        // Wait for the wake up message
         uint8_t dummy[1];
         my_read(dummy, 1);
 
-        uint8_t banner[32];
-        sprintf(banner, "%s\n", flash_device->name);
+        // Reply with the banner: device name and device capacity
+        uint8_t banner[64];
+        sprintf(banner, "%s %d\n", flash_device->name, flash_device->capacity_bytes);
         my_write(banner, strlen(banner));
 
+        // Get the command byte and run the requested operation
         uint8_t command[1];
         my_read(command, 1);
 
