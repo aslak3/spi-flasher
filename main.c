@@ -14,6 +14,7 @@
 #define FLASH_CMD_READ_BYTES 0x03
 #define FLASH_CMD_FAST_READ_BYTES 0x0b
 #define FLASH_CMD_ERASE_BULK 0xc7
+#define FLASH_CMD_WRITE_STATUS 0x01
 #define FLASH_CMD_READ_STATUS 0x05
 
 #define FLASH_STATUS_BUSY_MASK 0x01
@@ -28,8 +29,9 @@ size_t my_read(uint8_t *buf, size_t len);
 size_t my_write(uint8_t *buf, size_t len);
 void send_command(uint8_t command, bool raise_cs);
 flash_dev_t* get_device_identification(void);
-void wait_until_not_busy(void);
-void bulk_erase(void);
+void wait_until_not_busy(bool slow);
+void erase_bulk(void);
+void clear_protection(void);
 void write_bytes(uint8_t *buffer, size_t len, uint32_t start_address);
 void read_bytes(uint8_t *buffer, size_t len,  uint32_t start_address);
 int reprogram_flash(flash_dev_t *flash_device);
@@ -68,6 +70,7 @@ void send_command(uint8_t command, bool raise_cs)
 #define JEDEC_SST 0xbf
 #define JEDEC_KH 0xc2
 #define JEDEC_WINBOND 0xef
+#define JEDEC_MICRON 0x20
 
 #define MBITS_TO_BYTES(b) ((b * 1024 * 1024) / 8)
 
@@ -104,7 +107,7 @@ flash_dev_t flash_devices[] = {
         MBITS_TO_BYTES(16),
     },
     {
-        // Tested (reads)
+        // Tested
         { JEDEC_KH, 0x20, 0x16 },
         "KH25L3233F",
         MBITS_TO_BYTES(32),
@@ -113,6 +116,11 @@ flash_dev_t flash_devices[] = {
         { JEDEC_WINBOND, 0x60, 0x16 },
         "W25Q64FW",
         MBITS_TO_BYTES(64),
+    },
+    {
+        { JEDEC_MICRON, 0xba, 0x16 },
+        "N25Q032A",
+        MBITS_TO_BYTES(32),
     },
     {
         { 0, 0, 0},
@@ -135,32 +143,57 @@ flash_dev_t* get_device_identification(void)
             return &flash_devices[i];
     }
 
+    // Make sure console has woken up
+    sleep_ms(2000);
+    printf("Could not identify, got %02x %02x %02x %02x\r\n", response[0], response[1], response[2], response[3]);
+
     return NULL;
 }
 
-void wait_until_not_busy(void)
+#define FLASH_STATUS_BUSY_MASK 0x01
+#define FLASH_STATUS_WE_MASK 0x02
+
+void wait_until_not_busy(bool slow)
 {
     uint8_t response[1];
 
-    send_command(FLASH_CMD_READ_STATUS, false);
-
     while (true) {
+        send_command(FLASH_CMD_READ_STATUS, false);
+
         spi_read_blocking(spi_default, 0, response, 1);
 
-        if (!(response[0] & FLASH_STATUS_BUSY_MASK))
-            break;
-    }
+        gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
 
-    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
+        if (!(response[0] & (FLASH_STATUS_BUSY_MASK | FLASH_STATUS_WE_MASK)))
+            break;
+
+        if (slow)
+            sleep_ms(100);
+    }
 }
 
-void bulk_erase(void)
+void erase_bulk(void)
 {
     send_command(FLASH_CMD_WRITE_EN, true);
 
     send_command(FLASH_CMD_ERASE_BULK, true);
 
-    wait_until_not_busy();
+    wait_until_not_busy(true);
+}
+
+void clear_protection(void)
+{
+    send_command(FLASH_CMD_WRITE_EN, true);
+
+    send_command(FLASH_CMD_WRITE_STATUS, false);
+
+    uint8_t buffer[1] = { 0 };
+
+    spi_write_blocking(spi_default, buffer, 1);
+
+    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
+
+    sleep_ms(200);
 }
 
 void write_bytes(uint8_t *buffer, size_t len, uint32_t start_address)
@@ -180,7 +213,7 @@ void write_bytes(uint8_t *buffer, size_t len, uint32_t start_address)
 
     gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
 
-    wait_until_not_busy();
+    wait_until_not_busy(false);
 }
 
 void read_bytes(uint8_t *buffer, size_t len, uint32_t start_address)
@@ -208,7 +241,9 @@ int reprogram_flash(flash_dev_t *flash_device)
     uint32_t page_count;
     my_read((uint8_t *) &page_count, sizeof(uint32_t));
 
-    bulk_erase();
+    clear_protection();
+
+    erase_bulk();
 
     uint8_t read_write_buffer[FLASH_PAGE_SIZE];
 
@@ -255,7 +290,7 @@ int read_flash(flash_dev_t *flash_device)
 int main()
 {
     // Enable SPI 0 at 1 MHz and connect to GPIOs
-    spi_init(spi_default, 1 * 1000 * 1000);
+    spi_init(spi_default, 10 * 1000 * 1000);
     gpio_set_function(PICO_DEFAULT_SPI_RX_PIN, GPIO_FUNC_SPI);
     gpio_set_function(PICO_DEFAULT_SPI_SCK_PIN, GPIO_FUNC_SPI);
     gpio_set_function(PICO_DEFAULT_SPI_TX_PIN, GPIO_FUNC_SPI);
@@ -268,14 +303,19 @@ int main()
     stdio_set_translate_crlf(&stdio_usb, false);
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    // Currently the LED is not used
-    const uint LED_PIN = PICO_DEFAULT_LED_PIN;
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
     flash_dev_t *flash_device = get_device_identification();
     if (!flash_device) {
-        return 1;
+        while (1) {
+            // Can't do anything, but previous call would have printed a diagnsotic
+            gpio_put(PICO_DEFAULT_LED_PIN, false);
+            sleep_ms(500);
+
+            gpio_put(PICO_DEFAULT_LED_PIN, true);
+            sleep_ms(500);
+        }
     }
 
     while (1) {
@@ -292,11 +332,16 @@ int main()
         uint8_t command[1];
         my_read(command, 1);
 
+        gpio_put(PICO_DEFAULT_LED_PIN, true);
+
         if (command[0] == 'f') {
             reprogram_flash(flash_device);
         } else if (command[0] == 'r') {
             read_flash(flash_device);
         }
+
+        gpio_put(PICO_DEFAULT_LED_PIN, false);
+
     }
     return 0;
 }

@@ -82,6 +82,15 @@ func reprogramFlash(port serial.Port, fileData []byte) error {
 			return fmt.Errorf("could not read mark from port: %s", err)
 		}
 
+		if buff[0] != '#' {
+			message, err := getLine(port)
+			if err != nil {
+				return fmt.Errorf("could not read line from port: %s", err)
+			}
+
+			return fmt.Errorf("got an error writing: %s", message)
+
+		}
 		fmt.Printf("#")
 	}
 
@@ -203,7 +212,10 @@ func main() {
 		}
 		fmt.Printf("File is %d bytes (%d pages)\n", len(fileData), len(fileData)/256)
 
-		reprogramFlash(port, fileData)
+		err = reprogramFlash(port, fileData)
+		if err != nil {
+			log.Fatalf("Could not write flash: %s", err)
+		}
 	} else if *readMode {
 		// Send the "we want to flash" code
 		_, err = port.Write([]byte("r"))
