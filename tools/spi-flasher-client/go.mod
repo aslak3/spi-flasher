@@ -1,4 +1,4 @@
-module aslak.net/spi-flasher-clilent
+module aslak.net/spi-flasher-client
 
 go 1.19
 

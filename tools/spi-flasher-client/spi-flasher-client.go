@@ -39,14 +39,16 @@ func getLine(port serial.Port) (string, error) {
 }
 
 // Read a file into a []byte, padding it to the page size
-func readFileWithPadding(filename string) ([]byte, error) {
+func readFileMaybeWithPadding(filename string, padding bool) ([]byte, error) {
 	fileData, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
 
-	for (len(fileData) % 256) != 0 {
-		fileData = append(fileData, byte(0))
+	if padding {
+		for (len(fileData) % 256) != 0 {
+			fileData = append(fileData, byte(0))
+		}
 	}
 
 	return fileData, nil
@@ -89,7 +91,6 @@ func reprogramFlash(port serial.Port, fileData []byte) error {
 			}
 
 			return fmt.Errorf("got an error writing: %s", message)
-
 		}
 		fmt.Printf("#")
 	}
@@ -151,9 +152,104 @@ func readFlash(port serial.Port, capacity int) ([]byte, error) {
 	return fileData, nil
 }
 
+func programFPGA(port serial.Port, fileData []byte) error {
+	// Get the +++ prompt
+	_, err := getLine(port)
+	if err != nil {
+		return fmt.Errorf("could not read line from port: %s", err)
+	}
+
+	var address int = 0
+	for address < len(fileData) {
+		remainingBytes := len(fileData) - address
+		var blockSize uint8 = 255
+		if remainingBytes < 255 {
+			blockSize = uint8(remainingBytes)
+		}
+
+		// Get the size of the file in 256 byte pages and send it, little endian
+		blockSizeAsByte := make([]byte, 1)
+		blockSizeAsByte[0] = blockSize
+		_, err = port.Write(blockSizeAsByte)
+		if err != nil {
+			return fmt.Errorf("could not write to port: %s", err)
+		}
+
+		// Write this page
+		_, err = port.Write(fileData[address : address+int(blockSize)])
+		if err != nil {
+			return fmt.Errorf("could not write to port: %s", err)
+		}
+		address += int(blockSize)
+
+		// Read the end-page pause "wakeup", which indicates the programmer has written this page and
+		// the client should send the next
+		buff := make([]byte, 1)
+		_, err = port.Read(buff)
+		if err != nil {
+			return fmt.Errorf("could not read mark from port: %s", err)
+		}
+
+		if buff[0] != '#' {
+			message, err := getLine(port)
+			if err != nil {
+				return fmt.Errorf("could not read line from port: %s", err)
+			}
+
+			return fmt.Errorf("got an error writing: %s", message)
+		}
+		fmt.Printf("#")
+	}
+
+	endMarkerAsByte := make([]byte, 1)
+	endMarkerAsByte[0] = 0
+	_, err = port.Write(endMarkerAsByte)
+	if err != nil {
+		return fmt.Errorf("could not write to port: %s", err)
+	}
+
+	buff := make([]byte, 1)
+	_, err = port.Read(buff)
+	if err != nil {
+		return fmt.Errorf("could not read mark from port: %s", err)
+	}
+
+	fmt.Printf("\n")
+
+	if buff[0] == 'H' {
+		fmt.Printf("Got a HIGH on CDONE\n")
+	} else {
+		fmt.Printf("Got a LOW on CDONE\n")
+	}
+
+	fmt.Printf("Done\n")
+
+	return nil
+}
+
+func handleDeviceBanner(port serial.Port) (int, error) {
+	// Get the device type
+	banner, err := getLine(port)
+	if err != nil {
+		return 0, fmt.Errorf("could not read line from port: %s", err)
+	}
+
+	// Get the banner line and parse it into a device string and a capacity
+	var name string
+	var capacity_bytes int
+	_, err = fmt.Sscanf(banner, "%s %d", &name, &capacity_bytes)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse the banner, got [%s]: %s", banner, err)
+	}
+	fmt.Printf("Device: %s Capacity: %d\n", name, capacity_bytes)
+
+	return capacity_bytes, nil
+}
+
 func main() {
-	writeMode := flag.Bool("write", false, "Enable writing mode")
-	readMode := flag.Bool("read", false, "Enable reading mode")
+	writeFlashMode := flag.Bool("write-flash", false, "Enable flash writing mode")
+	readFlashMode := flag.Bool("read-flash", false, "Enable flash reading mode")
+	writeFPGAMode := flag.Bool("write-fpga", false, "Enable FPGA writing mode")
 	portPtr := flag.String("port", "/dev/ttyACM0", "device node")
 	filenamePtr := flag.String("filename", "", ".bin file to flash")
 
@@ -165,11 +261,8 @@ func main() {
 	if *filenamePtr == "" {
 		log.Fatal("Filename not set")
 	}
-	if *readMode && *writeMode {
-		log.Fatal("Cannot specify both read and write modes")
-	}
-	if !*readMode && !*writeMode {
-		log.Fatal("Must specify either read or write mode")
+	if !*writeFlashMode && !*readFlashMode && !*writeFPGAMode {
+		log.Fatal("Must specify one of write-flash, read-flash or write-fpga")
 	}
 
 	// No mode content, since we only really support USB TTYs
@@ -184,29 +277,19 @@ func main() {
 		log.Fatal("Could not write to port")
 	}
 
-	// Get the device type
-	banner, err := getLine(port)
-	if err != nil {
-		log.Fatalf("Could not read line from port: %s", err)
-	}
-
-	// Get the banner line and parse it into a device string and a capacity
-	var name string
-	var capacity_bytes int
-	_, err = fmt.Sscanf(banner, "%s %d", &name, &capacity_bytes)
-	if err != nil {
-		log.Fatalf("Could not parse the banner, got [%s]: %s", banner, err)
-	}
-	fmt.Printf("Device: %s Capacity: %d\n", name, capacity_bytes)
-
-	if *writeMode {
-		// Send the "we want to flash" code
-		_, err = port.Write([]byte("f"))
+	if *writeFlashMode {
+		// Send the "we want to write to the flash" code
+		_, err = port.Write([]byte("w"))
 		if err != nil {
 			log.Fatalf("Could not send flash command: %s", err)
 		}
 
-		fileData, err := readFileWithPadding(*filenamePtr)
+		_, err := handleDeviceBanner(port)
+		if err != nil {
+			log.Fatalf("Could not handle device banner: %s", err)
+		}
+
+		fileData, err := readFileMaybeWithPadding(*filenamePtr, true)
 		if err != nil {
 			log.Fatalf("Could not read filename %s", *filenamePtr)
 		}
@@ -216,11 +299,16 @@ func main() {
 		if err != nil {
 			log.Fatalf("Could not write flash: %s", err)
 		}
-	} else if *readMode {
-		// Send the "we want to flash" code
+	} else if *readFlashMode {
+		// Send the "we want to read the flash" code
 		_, err = port.Write([]byte("r"))
 		if err != nil {
 			log.Fatalf("Could not send flash command: %s", err)
+		}
+
+		capacity_bytes, err := handleDeviceBanner(port)
+		if err != nil {
+			log.Fatalf("Could not handle device banner: %s", err)
 		}
 
 		fileData, err := readFlash(port, capacity_bytes)
@@ -231,6 +319,30 @@ func main() {
 		err = os.WriteFile(*filenamePtr, fileData, 0664)
 		if err != nil {
 			log.Fatalf("Could not write file: %s", err)
+		}
+	} else if *writeFPGAMode {
+		// Send the "we want to write to the fpga directly" code
+		_, err = port.Write([]byte("f"))
+		if err != nil {
+			log.Fatalf("Could not send write to FPGA command: %s", err)
+		}
+
+		banner, err := getLine(port)
+		if err != nil {
+			log.Fatalf("Could not read line from port: %s", err)
+		}
+
+		fmt.Printf("Got FPGA write banner: %s\n", banner)
+
+		fileData, err := readFileMaybeWithPadding(*filenamePtr, false)
+		if err != nil {
+			log.Fatalf("Could not read filename %s", *filenamePtr)
+		}
+		fmt.Printf("File is %d bytes\n", len(fileData))
+
+		err = programFPGA(port, fileData)
+		if err != nil {
+			log.Fatalf("Could not program FPGA: %s", err)
 		}
 	}
 }

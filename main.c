@@ -19,6 +19,9 @@
 
 #define FLASH_STATUS_BUSY_MASK 0x01
 
+#define CRESET_GPIO 20
+#define CDONE_GPIO 21
+
 typedef struct {
     uint8_t identificaiton_code[3];
     char *name;
@@ -35,6 +38,8 @@ void clear_protection(void);
 void write_bytes(uint8_t *buffer, size_t len, uint32_t start_address);
 void read_bytes(uint8_t *buffer, size_t len,  uint32_t start_address);
 int reprogram_flash(flash_dev_t *flash_device);
+flash_dev_t *send_flash_banner(void);
+void send_fpga_banner(void);
 
 size_t my_read(uint8_t *buf, size_t len)
 {
@@ -129,6 +134,7 @@ flash_dev_t flash_devices[] = {
     },
 };
 
+// Returned flash device description is global ro
 flash_dev_t* get_device_identification(void)
 {
     send_command(FLASH_CMD_READ_DEVICE_IDENTIFICATION, false);
@@ -267,6 +273,8 @@ int reprogram_flash(flash_dev_t *flash_device)
         my_write(read_write_buffer, FLASH_PAGE_SIZE);
     }
 
+    gpio_put(CRESET_GPIO, true);
+
     return 0;
 }
 
@@ -284,12 +292,107 @@ int read_flash(flash_dev_t *flash_device)
         my_write(read_buffer, FLASH_PAGE_SIZE);
     }
 
+    gpio_put(CRESET_GPIO, true);
+
     return 0;
+}
+
+int program_fpga(void)
+{
+    my_write("+++\n", 4);
+
+    uint8_t dummy_byte = 0;
+
+    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, false);
+
+    sleep_us(1); // > 200ns
+
+    gpio_put(CRESET_GPIO, true);
+
+    sleep_ms(2); // > 1200us
+
+    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
+
+    spi_write_blocking(spi_default, &dummy_byte, 1);
+
+    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, false);
+
+    while (true)
+    {
+        uint8_t block[256];
+        uint8_t block_size;
+        my_read(&block_size, sizeof(uint8_t));
+
+        if (block_size) {
+            my_read(&block, block_size);
+            spi_write_blocking(spi_default, &block, block_size);
+
+            my_write("#", 1);
+        }
+        else {
+            break;
+        }
+    }
+
+    sleep_us(1);
+
+    gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
+
+    // Must send at least 49 clocks, this is 56
+    for (int c = 0; c < 7; c++) {
+        spi_write_blocking(spi_default, &dummy_byte, 1);
+    }
+
+    if (gpio_get(CDONE_GPIO)) {
+        my_write("H", 1);
+    }
+    else {
+        my_write("L", 1);
+    }
+
+    return 0;
+}
+
+flash_dev_t *send_flash_banner(void)
+{
+    flash_dev_t *flash_device = get_device_identification();
+    if (!flash_device) {
+        while (1) {
+            // Can't do anything, but previous call would have printed a diagnsotic
+            gpio_put(PICO_DEFAULT_LED_PIN, false);
+            sleep_ms(500);
+
+            gpio_put(PICO_DEFAULT_LED_PIN, true);
+            sleep_ms(500);
+        }
+    }
+
+    // Reply with the banner: device name and device capacity
+    uint8_t banner[64];
+    sprintf(banner, "%s %d\n", flash_device->name, flash_device->capacity_bytes);
+    my_write(banner, strlen(banner));
+
+    return flash_device;
+}
+
+void send_fpga_banner(void)
+{
+    // Reply with the banner: device name and device capacity
+    uint8_t banner[64];
+    sprintf(banner, "FPGA write mode\n");
+    my_write(banner, strlen(banner));
 }
 
 int main()
 {
-    // Enable SPI 0 at 1 MHz and connect to GPIOs
+    gpio_init(CRESET_GPIO);
+    gpio_set_dir(CRESET_GPIO, true);
+    gpio_put(CRESET_GPIO, true);
+
+    gpio_init(CDONE_GPIO);
+    gpio_set_dir(CDONE_GPIO, false);
+
+    // Enable SPI 0 at 10 MHz and connect to GPIOs
     spi_init(spi_default, 10 * 1000 * 1000);
     gpio_set_function(PICO_DEFAULT_SPI_RX_PIN, GPIO_FUNC_SPI);
     gpio_set_function(PICO_DEFAULT_SPI_SCK_PIN, GPIO_FUNC_SPI);
@@ -306,27 +409,12 @@ int main()
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
-    flash_dev_t *flash_device = get_device_identification();
-    if (!flash_device) {
-        while (1) {
-            // Can't do anything, but previous call would have printed a diagnsotic
-            gpio_put(PICO_DEFAULT_LED_PIN, false);
-            sleep_ms(500);
-
-            gpio_put(PICO_DEFAULT_LED_PIN, true);
-            sleep_ms(500);
-        }
-    }
-
     while (1) {
         // Wait for the wake up message
         uint8_t dummy[1];
         my_read(dummy, 1);
 
-        // Reply with the banner: device name and device capacity
-        uint8_t banner[64];
-        sprintf(banner, "%s %d\n", flash_device->name, flash_device->capacity_bytes);
-        my_write(banner, strlen(banner));
+        gpio_put(CRESET_GPIO, false);
 
         // Get the command byte and run the requested operation
         uint8_t command[1];
@@ -334,11 +422,17 @@ int main()
 
         gpio_put(PICO_DEFAULT_LED_PIN, true);
 
-        if (command[0] == 'f') {
-            reprogram_flash(flash_device);
+        if (command[0] == 'w') {
+            reprogram_flash(send_flash_banner());
         } else if (command[0] == 'r') {
-            read_flash(flash_device);
+            read_flash(send_flash_banner());
+        } else if (command[0] == 'f') {
+            // For consistency a "device" banner is sent
+            send_fpga_banner();
+            program_fpga();
         }
+
+        gpio_put(CRESET_GPIO, true);
 
         gpio_put(PICO_DEFAULT_LED_PIN, false);
 
