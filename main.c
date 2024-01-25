@@ -317,6 +317,7 @@ int program_fpga(void)
 
     gpio_put(PICO_DEFAULT_SPI_CSN_PIN, false);
 
+    // Loop until we get a blocksize of zero
     while (true)
     {
         uint8_t block[256];
@@ -324,17 +325,18 @@ int program_fpga(void)
         my_read(&block_size, sizeof(uint8_t));
 
         if (block_size) {
-            my_read(&block, block_size);
-            spi_write_blocking(spi_default, &block, block_size);
+            // Read this many bytes, writing them to the FPGA
+            my_read(block, (size_t) block_size);
+            spi_write_blocking(spi_default, block, block_size);
 
+            // Wake up the client so it will send the next block
             my_write("#", 1);
         }
         else {
+            // End of image
             break;
         }
     }
-
-    sleep_us(1);
 
     gpio_put(PICO_DEFAULT_SPI_CSN_PIN, true);
 
@@ -343,6 +345,7 @@ int program_fpga(void)
         spi_write_blocking(spi_default, &dummy_byte, 1);
     }
 
+    // Look at CDONE and output, to the client, a code indicating its state
     if (gpio_get(CDONE_GPIO)) {
         my_write("H", 1);
     }
@@ -355,6 +358,7 @@ int program_fpga(void)
 
 flash_dev_t *send_flash_banner(void)
 {
+    // Get the SPI flash device type
     flash_dev_t *flash_device = get_device_identification();
     if (!flash_device) {
         while (1) {
@@ -377,7 +381,7 @@ flash_dev_t *send_flash_banner(void)
 
 void send_fpga_banner(void)
 {
-    // Reply with the banner: device name and device capacity
+    // Reply with a dummny banner
     uint8_t banner[64];
     sprintf(banner, "FPGA write mode\n");
     my_write(banner, strlen(banner));
@@ -385,6 +389,7 @@ void send_fpga_banner(void)
 
 int main()
 {
+    // Setup the CRESET and CDONE FPGA pins on the Pico
     gpio_init(CRESET_GPIO);
     gpio_set_dir(CRESET_GPIO, true);
     gpio_put(CRESET_GPIO, true);
@@ -406,36 +411,40 @@ int main()
     stdio_set_translate_crlf(&stdio_usb, false);
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    // Status LED is turned on when programming/reading
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
     while (1) {
         // Wait for the wake up message
-        uint8_t dummy[1];
-        my_read(dummy, 1);
+        uint8_t dummy;
+        my_read(&dummy, 1);
 
+        // We now bring the FPGA, if attached, into reset
         gpio_put(CRESET_GPIO, false);
 
         // Get the command byte and run the requested operation
-        uint8_t command[1];
-        my_read(command, 1);
+        uint8_t command;
+        my_read(&command, 1);
 
         gpio_put(PICO_DEFAULT_LED_PIN, true);
 
-        if (command[0] == 'w') {
+        if (command == 'w') {
             reprogram_flash(send_flash_banner());
-        } else if (command[0] == 'r') {
+        } else if (command == 'r') {
             read_flash(send_flash_banner());
-        } else if (command[0] == 'f') {
+        } else if (command == 'f') {
             // For consistency a "device" banner is sent
             send_fpga_banner();
             program_fpga();
         }
 
-        gpio_put(CRESET_GPIO, true);
-
         gpio_put(PICO_DEFAULT_LED_PIN, false);
 
+        // Release the reset FPGA pin so it will start the new bitstream
+        gpio_put(CRESET_GPIO, true);
     }
+
+    // Not reached
     return 0;
 }

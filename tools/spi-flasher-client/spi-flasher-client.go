@@ -54,6 +54,27 @@ func readFileMaybeWithPadding(filename string, padding bool) ([]byte, error) {
 	return fileData, nil
 }
 
+func waitUntilBlockDone(port serial.Port) error {
+	// Read the end-page pause "wakeup", which indicates the programmer has written this page and
+	// the client should send the next
+	buff := make([]byte, 1)
+	_, err := port.Read(buff)
+	if err != nil {
+		return fmt.Errorf("could not read mark from port: %s", err)
+	}
+
+	if buff[0] != '#' {
+		message, err := getLine(port)
+		if err != nil {
+			return fmt.Errorf("could not read line from port: %s", err)
+		}
+
+		return fmt.Errorf("got an error writing: %s", message)
+	}
+
+	return nil
+}
+
 func reprogramFlash(port serial.Port, fileData []byte) error {
 	// Get the +++ prompt
 	_, err := getLine(port)
@@ -76,22 +97,11 @@ func reprogramFlash(port serial.Port, fileData []byte) error {
 			return fmt.Errorf("could not write to port: %s", err)
 		}
 
-		// Read the end-page pause "wakeup", which indicates the programmer has written this page and
-		// the client should send the next
-		buff := make([]byte, 1)
-		_, err = port.Read(buff)
+		err = waitUntilBlockDone(port)
 		if err != nil {
-			return fmt.Errorf("could not read mark from port: %s", err)
+			return fmt.Errorf("could not wait until block done: %s", err)
 		}
 
-		if buff[0] != '#' {
-			message, err := getLine(port)
-			if err != nil {
-				return fmt.Errorf("could not read line from port: %s", err)
-			}
-
-			return fmt.Errorf("got an error writing: %s", message)
-		}
 		fmt.Printf("#")
 	}
 
@@ -182,22 +192,11 @@ func programFPGA(port serial.Port, fileData []byte) error {
 		}
 		address += int(blockSize)
 
-		// Read the end-page pause "wakeup", which indicates the programmer has written this page and
-		// the client should send the next
-		buff := make([]byte, 1)
-		_, err = port.Read(buff)
+		err = waitUntilBlockDone(port)
 		if err != nil {
-			return fmt.Errorf("could not read mark from port: %s", err)
+			return fmt.Errorf("could not wait until block done: %s", err)
 		}
 
-		if buff[0] != '#' {
-			message, err := getLine(port)
-			if err != nil {
-				return fmt.Errorf("could not read line from port: %s", err)
-			}
-
-			return fmt.Errorf("got an error writing: %s", message)
-		}
 		fmt.Printf("#")
 	}
 
@@ -227,7 +226,7 @@ func programFPGA(port serial.Port, fileData []byte) error {
 	return nil
 }
 
-func handleDeviceBanner(port serial.Port) (int, error) {
+func handleFlashBanner(port serial.Port) (int, error) {
 	// Get the device type
 	banner, err := getLine(port)
 	if err != nil {
@@ -284,9 +283,9 @@ func main() {
 			log.Fatalf("Could not send flash command: %s", err)
 		}
 
-		_, err := handleDeviceBanner(port)
+		_, err := handleFlashBanner(port)
 		if err != nil {
-			log.Fatalf("Could not handle device banner: %s", err)
+			log.Fatalf("Could not handle flash banner: %s", err)
 		}
 
 		fileData, err := readFileMaybeWithPadding(*filenamePtr, true)
@@ -306,9 +305,9 @@ func main() {
 			log.Fatalf("Could not send flash command: %s", err)
 		}
 
-		capacity_bytes, err := handleDeviceBanner(port)
+		capacity_bytes, err := handleFlashBanner(port)
 		if err != nil {
-			log.Fatalf("Could not handle device banner: %s", err)
+			log.Fatalf("Could not handle flash banner: %s", err)
 		}
 
 		fileData, err := readFlash(port, capacity_bytes)
