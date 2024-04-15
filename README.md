@@ -30,6 +30,8 @@ The tool takes four options:
 
 --write-flash : used for writing the file to the SPI flash
 
+--read-flash : used for reading the current complete content out of the SPI flash and writing it to the specified file
+
 --write-fpga : used for writing the file to the iCE40 FPGA
 
 This software is described in more detail on my blog, at:
